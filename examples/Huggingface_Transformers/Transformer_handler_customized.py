@@ -20,6 +20,7 @@ from transformers import (
     BloomTokenizerFast
 )
 
+import colossalai
 from colossalai.inference.tensor_parallel.engine import TPInferEngine
 from colossalai.shardformer import ShardConfig
 
@@ -50,6 +51,8 @@ class TransformersTestHandler(BaseHandler, ABC):
         self.manifest = ctx.manifest
         properties = ctx.system_properties
         model_dir = properties.get("model_dir")
+        logger.info(f"Loading from model_dir {model_dir}")
+        print(f"Loading from model_dir {model_dir}")
         filepath = model_dir + '/inference_config.json'
         with open(filepath, 'r') as file:
             config = json.load(file)
@@ -85,27 +88,36 @@ class TransformersTestHandler(BaseHandler, ABC):
         else:
             print(f"config['model_type'] {config['model_type']} not supported yet.")
 
+        logger.info("Transformer model from path %s loaded successfully", model_dir)
+
         self.model = self.model.half()
         self.model.cuda()
         self.model.eval()
 
+        logger.info("Initializing TPInferEngine ...")
+
+        # FIXME might error out when launching colossalai
+        # colossalai.launch(config={}, rank=rank, world_size=world_size, host='localhost', port=port, backend='nccl')
+        colossalai.launch_from_torch(config={})
+        
         shard_config = ShardConfig(enable_tensor_parallelism=True if config["tp_size"] > 1 else False, inference_only=True)
         self.infer_engine = TPInferEngine(self.model, shard_config, config['max_batch_size'], config['max_input_len'], config['max_output_len'])
         # self.model = self.infer_engine.model
 
-        logger.info("Transformer model from path %s loaded successfully", model_dir)
+        logger.info("TPInferEngine initialized successfully")
 
         self.initialized = True
 
 
     def preprocess(self, requests):
-        """
+        """Basic text preprocessing, based on the user's chocie of application mode.
         Args:
             requests (str): The Input data in the form of text is passed on to the preprocess
             function.
         Returns:
             list : The preprocess function returns a list of Tensor for the size of the word tokens.
         """
+        logger.info("Pre-processing requests", requests)
         input_ids_batch = None
         attention_mask_batch = None
         for idx, data in enumerate(requests):
@@ -114,51 +126,16 @@ class TransformersTestHandler(BaseHandler, ABC):
                 input_text = data.get("body")
             if isinstance(input_text, (bytes, bytearray)):
                 input_text = input_text.decode("utf-8")
-            if (
-                self.setup_config["captum_explanation"]
-                and not self.setup_config["mode"] == "question_answering"
-            ):
-                input_text_target = ast.literal_eval(input_text)
-                input_text = input_text_target["text"]
-            max_length = self.setup_config["max_length"]
+
             logger.info("Received text: '%s'", input_text)
-            # preprocessing text for sequence_classification, token_classification or text_generation
-            if self.setup_config["mode"] in {
-                "sequence_classification",
-                "token_classification",
-                "text_generation",
-            }:
-                inputs = self.tokenizer.encode_plus(
-                    input_text,
-                    max_length=int(max_length),
-                    pad_to_max_length=True,
-                    add_special_tokens=True,
-                    return_tensors="pt",
-                )
 
-            # preprocessing text for question_answering.
-            elif self.setup_config["mode"] == "question_answering":
-                # TODO Reading the context from a pickeled file or other fromats that
-                # fits the requirements of the task in hand. If this is done then need to
-                # modify the following preprocessing accordingly.
+            inputs = self.tokenizer.encode_plus(
+                input_text,
+                pad_to_max_length=True,
+                add_special_tokens=True,
+                return_tensors="pt",
+            )
 
-                # the sample text for question_answering in the current version
-                # should be formated as dictionary with question and text as keys
-                # and related text as values.
-                # we use this format here seperate question and text for encoding.
-
-                question_context = ast.literal_eval(input_text)
-                question = question_context["question"]
-                context = question_context["context"]
-                inputs = self.tokenizer.encode_plus(
-                    question,
-                    context,
-                    max_length=int(max_length),
-                    pad_to_max_length=True,
-                    add_special_tokens=True,
-                    return_tensors="pt",
-                )
-            
             input_ids = inputs["input_ids"].to(self.device)
             attention_mask = inputs["attention_mask"].to(self.device)
             # making a batch out of the recieved requests
@@ -186,27 +163,25 @@ class TransformersTestHandler(BaseHandler, ABC):
         input_ids_batch, attention_mask_batch = input_batch
         inferences = []
 
-        # Handling inference for text_generation.
-        if self.setup_config["mode"] == "text_generation":
-            if self.setup_config["model_parallel"]:
-                # Need to move the first device, as the trasnformer model has been placed there
-                # https://github.com/huggingface/transformers/blob/v4.17.0/src/transformers/models/gpt2/modeling_gpt2.py#L970
-                input_ids_batch = input_ids_batch.to("cuda:0")
-            # FIXME use args in config instead
-            outputs = self.infer_engine.generate(
-                input_ids_batch, max_length=50, do_sample=True, top_p=0.95, top_k=60
+        # mode: text_generation
+        input_ids_batch = input_ids_batch.to(self.device)
+        outputs = self.infer_engine.generate(
+            input_ids_batch,
+            do_sample=False,
+            # top_p=0.95,
+            # top_k=60,
+        )
+
+        logger.info(f"Generated outputs: {outputs}")
+
+        for i, _ in enumerate(outputs):
+            inferences.append(
+                self.tokenizer.decode(outputs[i], skip_special_tokens=True)
             )
-            for i, x in enumerate(outputs):
-                inferences.append(
-                    self.tokenizer.decode(outputs[i], skip_special_tokens=True)
-                )
 
-            logger.info("Generated text: '%s'", inferences)
-
-        else:
-            raise NotImplementedError("Test demo only for text_generation at this moment")
-
+        logger.info("Generated text: '%s'", inferences)
         print("Generated text", inferences)
+
         return inferences
 
 
