@@ -1,4 +1,3 @@
-import ast
 import json
 import logging
 import os
@@ -7,14 +6,8 @@ from abc import ABC
 
 import torch
 import transformers
-from captum.attr import LayerIntegratedGradients
 from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForQuestionAnswering,
-    AutoModelForSequenceClassification,
-    AutoModelForTokenClassification,
     AutoTokenizer,
-    GPT2TokenizerFast,
     LlamaForCausalLM,
     BloomForCausalLM,
     BloomTokenizerFast
@@ -23,11 +16,14 @@ from transformers import (
 import colossalai
 from colossalai.inference.tensor_parallel.engine import TPInferEngine
 from colossalai.shardformer import ShardConfig
+from colossalai.testing import free_port  # assins a random port, for demo use only
 
 from ts.torch_handler.base_handler import BaseHandler
 
+
 logger = logging.getLogger(__name__)
 logger.info("Transformers version %s", transformers.__version__)
+logger.info("ColossalAI version %s", colossalai.__version__)
 
 
 class TransformersTestHandler(BaseHandler, ABC):
@@ -39,7 +35,7 @@ class TransformersTestHandler(BaseHandler, ABC):
         super(TransformersTestHandler, self).__init__()
         self.initialized = False
         self.infer_engine = None
-
+        
 
     def initialize(self, ctx):
         """Expected behaviour: the sharded Bloom/Llama model is loaded.
@@ -50,25 +46,30 @@ class TransformersTestHandler(BaseHandler, ABC):
         """
         self.manifest = ctx.manifest
         properties = ctx.system_properties
-        model_dir = properties.get("model_dir")
-        logger.info(f"Loading from model_dir {model_dir}")
-        print(f"Loading from model_dir {model_dir}")
-        filepath = model_dir + '/inference_config.json'
-        with open(filepath, 'r') as file:
-            config = json.load(file)
 
         self.device = torch.device(
             "cuda:" + str(properties.get("gpu_id"))
             if torch.cuda.is_available() and properties.get("gpu_id") is not None
             else "cpu"
         )
+        logger.info(f"device set to {self.device}")
 
-        # Loading the model and tokenizer from checkpoint and config files based on the user's choice of mode
-        # further setup config can be added.
-        # NOTE: .bin/.json/config => zip => MAR => zip => unzip => load model by from_pretrained
+
+        # NOTE: zip model dir to model.zip
+        #       => torch-model-archiver archives model.zip and extra files (e.g. config) to a .mar file 
+        #       => torchserve
+        #       => load and unpack .mar file to model.zip, config.json, etc
+        #       => unzip model.zip and load model via from_pretrained
+        model_dir = properties.get("model_dir")
+        logger.info(f"Loading from model_dir {model_dir}")
+        # Load inference config file
+        filepath = model_dir + '/inference_config.json'
+        with open(filepath, 'r') as file:
+            config = json.load(file)
+        # Load the model
         with zipfile.ZipFile(model_dir + "/model.zip", "r") as zip_ref:
             zip_ref.extractall(model_dir + "/model")
-
+        logger.info(f"Loading {config['model_type']} pretrain model and tokenizer")
         if config["model_type"] == "bloom":
             print("loading bloom pretrain model and tokenizer")
             self.model = BloomForCausalLM.from_pretrained(
@@ -86,26 +87,38 @@ class TransformersTestHandler(BaseHandler, ABC):
                 model_dir + "/model", return_tensors="pt"
             )
         else:
-            print(f"config['model_type'] {config['model_type']} not supported yet.")
+            logger.warning(f"Model type {config['model_type']} not supported yet.")
 
         logger.info("Transformer model from path %s loaded successfully", model_dir)
+        logger.info(f"torch.cuda.device_count() {torch.cuda.device_count()}")
 
-        self.model = self.model.half()
+        self.model.half()
         self.model.cuda()
         self.model.eval()
 
-        logger.info("Initializing TPInferEngine ...")
+        local_rank = int(os.getenv("LOCAL_RANK", 0))
+        world_size = int(os.getenv("WORLD_SIZE", 1))
+        rank = int(os.getenv("RANK", 0))
+        host = os.getenv("MASTER_ADDR", 'localhost')
+        port = os.getenv("MASTER_PORT", free_port())  # use a random free port
+        logger.info(
+            f"  local_rank {local_rank}"
+            f"  world_size {world_size}"
+            f"  rank {rank}"
+            f"  host {host}"
+            f"  port {port}"
+        )
 
-        # FIXME might error out when launching colossalai
-        # colossalai.launch(config={}, rank=rank, world_size=world_size, host='localhost', port=port, backend='nccl')
-        colossalai.launch_from_torch(config={})
+        torch.cuda.set_device(local_rank)
+
+        colossalai.launch(config={}, rank=rank, world_size=world_size, host=host, port=port, backend='nccl')
         
+        logger.info("Initializing TPInferEngine ...")
         shard_config = ShardConfig(enable_tensor_parallelism=True if config["tp_size"] > 1 else False, inference_only=True)
         self.infer_engine = TPInferEngine(self.model, shard_config, config['max_batch_size'], config['max_input_len'], config['max_output_len'])
-        # self.model = self.infer_engine.model
-
         logger.info("TPInferEngine initialized successfully")
 
+        self.model = self.infer_engine.model
         self.initialized = True
 
 
@@ -117,7 +130,7 @@ class TransformersTestHandler(BaseHandler, ABC):
         Returns:
             list : The preprocess function returns a list of Tensor for the size of the word tokens.
         """
-        logger.info("Pre-processing requests", requests)
+        logger.info("Pre-processing requests")
         input_ids_batch = None
         attention_mask_batch = None
         for idx, data in enumerate(requests):
@@ -179,8 +192,7 @@ class TransformersTestHandler(BaseHandler, ABC):
                 self.tokenizer.decode(outputs[i], skip_special_tokens=True)
             )
 
-        logger.info("Generated text: '%s'", inferences)
-        print("Generated text", inferences)
+        logger.info(f"Generated text: {inferences}", )
 
         return inferences
 

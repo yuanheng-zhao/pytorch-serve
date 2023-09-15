@@ -1,0 +1,26 @@
+#frontend settings
+minWorkers: 1
+maxWorkers: 1
+maxBatchDelay: 100
+responseTimeout: 120
+deviceType: "gpu"
+deviceIds: [0] # seting CUDA_VISIBLE_DEVICES
+parallelType: "tp" # options depending on the solution, pp(pipeline parallelism), tp(tensor parallelism), pptp ( pipeline and tensor parallelism)
+                   # This will be used to route input to either rank0 or all ranks from fontend based on the solution (e.g. DeepSpeed support tp, PiPPy support pp)
+num_worker_threads: 1
+default_workers_per_model: 1
+
+torchrun:
+    nproc-per-node: 1 # specifies the number of processes torchrun starts to serve your model, set to world_size or number of
+                      # gpus you wish to split your model
+#backend settings
+# pippy:
+#     chunks: 1 # This sets the microbatch sizes, microbatch = batch size/ chunks
+#     input_names: ['input_ids'] # input arg names to the model, this is required for FX tracing
+#     model_type: "HF" # set the model type to HF if you are using Huggingface model other wise leave it blank or any other model you use.
+#     rpc_timeout: 1800
+#     num_worker_threads: 1 #set number of threads for rpc worker init.
+
+handler:
+    max_length: 1024 # max length of tokens for tokenizer in the handler
+
