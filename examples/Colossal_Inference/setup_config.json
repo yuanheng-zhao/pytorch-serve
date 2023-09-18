@@ -1,0 +1,11 @@
+{
+    "revision": "main",
+    "max_memory": {
+        "0": "40GB",
+        "cpu": "10GB"
+    },
+    "low_cpu_mem_usage": true,
+    "device_map": "auto",
+    "torch_dtype":"float16",
+    "max_length":"1152"
+}
